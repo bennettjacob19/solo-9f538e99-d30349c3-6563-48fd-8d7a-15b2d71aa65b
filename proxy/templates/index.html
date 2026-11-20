@@ -58,6 +58,23 @@
 </section>
 
 <section>
+  <h2>上游端口池冷却期试算</h2>
+  <form method="post" action="{{ url_for('observe') }}">
+    <div class="row">
+      <label>拟定冷却(秒) <input name="cooldown" type="number" step="1"
+             min="{{ cooldown }}" max="{{ cooldown_max }}" value="{{ cooldown }}"
+             style="width:90px" required></label>
+      <button type="submit" id="observe-btn">开始 {{ observation.window }} 秒观察</button>
+      <span class="hint">现用冷却 {{ cooldown }}s，拟定不得短于现值、最多 {{ cooldown_max }}s；试算不改在线配置，转发照常。</span>
+    </div>
+    <p class="hint">观察期间可用下方“发送试传报文”发出真实 UDP 报文，用同一段实际端口占用记录分别回放现用与拟定冷却。观察开始时已预留的端口、按各档仍在冷却的占用都会计入；端口从预留起占用，绑定失败当即归还，正常关闭再加冷却。同一端口被复用后，按拟定时长尚未结束的旧冷却另算一个端口。</p>
+  </form>
+  <div id="observe-result" style="margin-top:10px">
+    <div class="hint" id="observe-status">尚未开始观察。</div>
+  </div>
+</section>
+
+<section>
   <h2>发送试传报文</h2>
   <form method="post" action="{{ url_for('test') }}">
     <div class="row">
@@ -101,10 +118,49 @@
 
 <script>
 function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+function fmtPeak(v) {
+  if (v == null) return '—';
+  return `${v.toFixed(1)}s`;
+}
+function renderObservation(o) {
+  const box = document.getElementById('observe-result');
+  const btn = document.getElementById('observe-btn');
+  if (!o) { box.innerHTML = '<div class="hint">尚未开始观察。</div>'; return; }
+  btn.disabled = o.status === 'running';
+  const base = o.baseline || {};
+  let html = '<div class="hint">';
+  if (o.status === 'running') {
+    html += `观察进行中：已 ${o.elapsed}s，剩余 ${o.remaining}s；`;
+  } else if (o.status === 'done') {
+    html += `观察已结束（${o.duration}s）；`;
+  }
+  html += `开场已预留 ${base.reserved || 0} 个端口，仍在冷却 现用 ${base.cooling_current || 0} / 拟定 ${base.cooling_proposed || 0} 个，`
+       + `本轮占用变更 ${o.event_count || 0} 次。</div>`;
+  if (o.status === 'invalid') {
+    html += `<div class="flash error">本轮只显示原因：${esc(o.reason || '未知原因')}</div>`;
+    box.innerHTML = html;
+    return;
+  }
+  if (o.status === 'done' && o.current && o.proposed) {
+    const hi = o.proposed.needed_ports > o.current.needed_ports ? '#c62828' : '#2e7d32';
+    html += '<table style="margin-top:8px"><thead><tr><th>冷却时长</th>'
+         + '<th>所需最少端口数</th><th>首次达到峰值的时刻</th></tr></thead><tbody>'
+         + `<tr><td>现用 ${esc(o.current_cooldown)}s</td><td><b>${o.current.needed_ports}</b></td>`
+         + `<td>${fmtPeak(o.current.peak_at)}</td></tr>`
+         + `<tr><td>拟定 ${esc(o.proposed_cooldown)}s</td><td><b style="color:${hi}">${o.proposed.needed_ports}</b></td>`
+         + `<td>${fmtPeak(o.proposed.peak_at)}</td></tr></tbody></table>`;
+  } else if (o.status === 'running') {
+    html += '<div class="hint">观察结束后给出所需最少端口数与首次达到峰值的时刻。</div>';
+  } else if (o.status === 'idle') {
+    html += '<div class="hint">尚未开始观察。</div>';
+  }
+  box.innerHTML = html;
+}
 async function refresh() {
   try {
     const s = await (await fetch('/api/state')).json();
     document.getElementById('target').textContent = s.target;
+    renderObservation(s.observation);
     const ss = s.sessions.map(x =>
       `<tr><td>${x.id}</td><td>${esc(x.client)}</td><td><b>${esc(x.receiver)}</b></td>` +
       `<td>${x.upstream_port ?? ''}</td><td>${esc(x.state)}</td><td>${x.idle}</td><td>${x.age}</td></tr>`);

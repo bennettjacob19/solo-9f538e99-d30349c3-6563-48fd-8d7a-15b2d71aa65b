@@ -15,13 +15,29 @@
 """
 
 import asyncio
+import json
+import math
 import os
 import socket
 import sqlite3
 import threading
 import time
+import uuid
 
 from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
+
+try:
+    from observation import (
+        DEFAULT_DURATION,
+        MAX_COOLDOWN,
+        PortObservation,
+    )
+except ImportError:  # 作为包导入时（如本地验证脚本）
+    from .observation import (  # type: ignore
+        DEFAULT_DURATION,
+        MAX_COOLDOWN,
+        PortObservation,
+    )
 
 # ---------------- 配置 ----------------
 UDP_LISTEN_HOST = os.environ.get("UDP_LISTEN_HOST", "0.0.0.0")
@@ -38,6 +54,11 @@ UPSTREAM_PORT_MAX = int(os.environ.get("UPSTREAM_PORT_MAX", "29999"))
 # 保证旧会话迟到的回包不会被复用同端口的新会话收到。应大于接收器最大回包延迟。
 UPSTREAM_PORT_COOLDOWN = float(os.environ.get("UPSTREAM_PORT_COOLDOWN", "30"))
 LOG_KEEP = int(os.environ.get("LOG_KEEP", "1000"))
+# 端口池冷却期试算：观察窗口（秒）与本轮占用变更上限
+OBSERVE_WINDOW = float(os.environ.get("OBSERVE_WINDOW", str(DEFAULT_DURATION)))
+OBSERVE_MAX_CHANGES = int(os.environ.get("OBSERVE_MAX_CHANGES", "4096"))
+# 拟定冷却期不得短于现值，也不得超过 120 秒（现值本身已超过 120 时仍可选现值）
+PROPOSED_COOLDOWN_MAX = max(MAX_COOLDOWN, UPSTREAM_PORT_COOLDOWN)
 
 RECEIVERS = {
     "A": (
@@ -163,22 +184,60 @@ class Store:
             ).fetchone()
         return row[0] if row else None
 
+    def get_setting(self, key):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key=?", (key,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_setting(self, key, value):
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value)
+            )
+            self._conn.commit()
+
 
 # ---------------- 上游端口分配（带冷却期） ----------------
 class PortAllocator:
     """显式管理上游本地端口：关闭后冷却期内不再分配，
-    确保旧会话迟到的回包不会被复用同端口的新会话收到。"""
+    确保旧会话迟到的回包不会被复用同端口的新会话收到。
+
+    每次预留都会得到一个 token；观察器按 token 记录占用区间。
+    冷却记录按端口保留较长时间（便于试算回放较长的拟定冷却），
+    但分配时只看最近一次关闭时刻与现值冷却。
+    """
+
+    _KEEP_PER_PORT = 4
 
     def __init__(self, low, high, cooldown):
         self.low, self.high, self.cooldown = low, high, cooldown
         self._next = low
-        self._in_use = set()
-        self._closed = {}  # port -> 关闭时刻(monotonic)
+        self._in_use = {}  # port -> token
+        self._closed = {}  # port -> [(关闭时刻(monotonic), token), ...]
+        self._token = 0
         self._lock = threading.Lock()
+        self.observer = None  # 端口占用观察器（可为空）
+
+    def _new_token_locked(self):
+        self._token += 1
+        return self._token
+
+    def _prune_locked(self, now):
+        horizon = max(self.cooldown, MAX_COOLDOWN)
+        for port in list(self._closed):
+            kept = [c for c in self._closed[port] if now - c[0] < horizon]
+            if kept:
+                self._closed[port] = kept[-self._KEEP_PER_PORT:]
+            else:
+                del self._closed[port]
 
     def allocate(self):
+        obs = self.observer
         with self._lock:
             now = time.monotonic()
+            self._prune_locked(now)
             for _ in range(self.high - self.low + 1):
                 port = self._next
                 self._next += 1
@@ -186,30 +245,64 @@ class PortAllocator:
                     self._next = self.low
                 if port in self._in_use:
                     continue
-                closed_at = self._closed.get(port)
-                if closed_at is not None and now - closed_at < self.cooldown:
+                closed = self._closed.get(port)
+                if closed and now - closed[-1][0] < self.cooldown:
                     continue
-                self._in_use.add(port)
-                self._closed.pop(port, None)
-                return port
+                token = self._new_token_locked()
+                self._in_use[port] = token
+                if obs is not None:
+                    obs.reserve(token, port, now)
+                return port, token
         raise RuntimeError("上游 UDP 端口耗尽")
 
-    def release(self, port):
+    def release(self, port, token=None):
+        obs = self.observer
         with self._lock:
-            self._in_use.discard(port)
-            self._closed[port] = time.monotonic()
+            now = time.monotonic()
+            current = self._in_use.get(port)
+            if current is None or (token is not None and current != token):
+                return
+            del self._in_use[port]
+            records = self._closed.setdefault(port, [])
+            records.append((now, current))
+            del records[:-self._KEEP_PER_PORT]
+            if obs is not None:
+                obs.release(current, port, now)
 
-    def discard(self, port):
+    def discard(self, port, token=None):
         """分配后绑定失败：不进入冷却，直接可用。"""
+        obs = self.observer
         with self._lock:
-            self._in_use.discard(port)
+            current = self._in_use.get(port)
+            if current is None or (token is not None and current != token):
+                return
+            del self._in_use[port]
+            if obs is not None:
+                obs.discard(current, port, time.monotonic())
 
-
-# ---------------- 会话与转发 ----------------
+    def begin_observation(self, obs, current_cooldown, proposed_cooldown,
+                          started_at, round_id=None):
+        """在分配器锁内取开场记录并开始观察，保证不漏记、不重记。"""
+        with self._lock:
+            now = time.monotonic()
+            self._prune_locked(now)
+            baseline = {
+                "reserved": [
+                    {"token": token, "port": port}
+                    for port, token in self._in_use.items()
+                ],
+                "cooldown": [
+                    {"token": token, "port": port, "closed_at": closed_at}
+                    for port, records in self._closed.items()
+                    for closed_at, token in records
+                ],
+            }
+            return obs.begin(baseline, current_cooldown, proposed_cooldown,
+                             started_at, now, round_id)# ---------------- 会话与转发 ----------------
 class Session:
     __slots__ = (
         "id", "client_addr", "receiver_name", "receiver_addr",
-        "upstream_port", "transport", "state", "closed",
+        "upstream_port", "upstream_token", "transport", "state", "closed",
         "created", "last_activity", "pending",
     )
 
@@ -219,6 +312,7 @@ class Session:
         self.receiver_name = ""
         self.receiver_addr = None
         self.upstream_port = None
+        self.upstream_token = None
         self.transport = None
         self.state = "opening"  # opening -> open -> closed
         self.closed = False
@@ -266,6 +360,49 @@ class ProxyState:
         self.lock = threading.RLock()
         self.next_session_id = 1
         self.ports = PortAllocator(UPSTREAM_PORT_MIN, UPSTREAM_PORT_MAX, UPSTREAM_PORT_COOLDOWN)
+        self.observation = PortObservation(OBSERVE_WINDOW, OBSERVE_MAX_CHANGES)
+        self.ports.observer = self.observation
+        self._restore_observation()
+
+    # ---- 观察轮次持久化：代理途中重启则本轮只显示原因 ----
+    def _restore_observation(self):
+        raw = None
+        try:
+            raw = self.store.get_setting("observation_round")
+        except Exception:
+            raw = None
+        if not raw:
+            return
+        try:
+            meta = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(meta, dict) or meta.get("status") != "running":
+            return
+        self.observation.restore_invalid("观察期间代理重启", meta)
+        try:
+            self.store.set_setting(
+                "observation_round",
+                json.dumps({**meta, "status": "invalid", "reason": "观察期间代理重启"},
+                           ensure_ascii=False),
+            )
+        except Exception:
+            pass
+
+    def _persist_observation(self, view):
+        try:
+            meta = {
+                "round_id": view.get("round_id"),
+                "status": view.get("status"),
+                "reason": view.get("reason", ""),
+                "started_at": view.get("started_at"),
+                "duration": view.get("duration"),
+                "current_cooldown": view.get("current_cooldown"),
+                "proposed_cooldown": view.get("proposed_cooldown"),
+            }
+            self.store.set_setting("observation_round", json.dumps(meta, ensure_ascii=False))
+        except Exception:
+            pass
 
     async def start(self):
         transport, _ = await self.loop.create_datagram_endpoint(
@@ -310,9 +447,10 @@ class ProxyState:
         try:
             transport = None
             upstream_port = None
+            upstream_token = None
             last_err = None
             for _ in range(8):
-                upstream_port = self.ports.allocate()
+                upstream_port, upstream_token = self.ports.allocate()
                 try:
                     transport, proto = await self.loop.create_datagram_endpoint(
                         lambda: UpstreamProtocol(self),
@@ -322,17 +460,18 @@ class ProxyState:
                     break
                 except OSError as exc:
                     last_err = exc
-                    self.ports.discard(upstream_port)
+                    self.ports.discard(upstream_port, upstream_token)
             if transport is None:
                 raise last_err or RuntimeError("无可用上游端口")
             with self.lock:
                 if sess.closed:
                     transport.close()
-                    self.ports.release(upstream_port)
+                    self.ports.release(upstream_port, upstream_token)
                     return
                 sess.receiver_name = target
                 sess.receiver_addr = (host, port)
                 sess.upstream_port = upstream_port
+                sess.upstream_token = upstream_token
                 sess.transport = transport
                 sess.state = "open"
                 proto.session = sess
@@ -344,6 +483,7 @@ class ProxyState:
         except Exception as exc:
             self.store.log("event", client=client, session_id=sess.id,
                            note=f"会话建立失败: {exc}")
+            self.observation.invalidate(f"有会话建连失败（{exc}）")
             self.close_session(sess, f"open-failed: {exc}")
 
     def _forward(self, sess, data):
@@ -391,10 +531,11 @@ class ProxyState:
             del self.sessions[sess.client_addr]
         transport, sess.transport = sess.transport, None
         port, sess.upstream_port = sess.upstream_port, None
+        token, sess.upstream_token = sess.upstream_token, None
         if transport is not None:
             transport.close()  # 迟到的回包到此端口将被系统丢弃
         if port is not None:
-            self.ports.release(port)  # 进入冷却期，冷却内不再分配
+            self.ports.release(port, token)  # 进入冷却期，冷却内不再分配
         self.store.log("event", client=fmt_addr(sess.client_addr), session_id=sess.id,
                        receiver=sess.receiver_name, note=f"会话关闭（{reason}）")
 
@@ -411,6 +552,7 @@ class ProxyState:
                            if not s.closed and now - s.last_activity > SESSION_IDLE_TIMEOUT]
                 for sess in expired:
                     self._close_session(sess, "idle-timeout")
+            self.observation.finalize_if_due(now)
 
     def snapshot_sessions(self):
         now = time.monotonic()
@@ -432,6 +574,7 @@ class ProxyState:
 # ---------------- Flask 网页 ----------------
 store = Store(DB_PATH)
 state = ProxyState(store)
+state.observation.set_finished_listener(state._persist_observation)
 app = Flask(__name__)
 app.secret_key = os.urandom(16)
 
@@ -453,6 +596,17 @@ def _format_message(m):
     return m
 
 
+def _observation_view():
+    view = state.observation.view()
+    view["current_cooldown"] = UPSTREAM_PORT_COOLDOWN  # 在线配置只读，不被试算改动
+    view["proposed_min"] = UPSTREAM_PORT_COOLDOWN
+    view["proposed_max"] = PROPOSED_COOLDOWN_MAX
+    view["window"] = OBSERVE_WINDOW
+    view["port_range"] = [UPSTREAM_PORT_MIN, UPSTREAM_PORT_MAX]
+    view["pool_size"] = UPSTREAM_PORT_MAX - UPSTREAM_PORT_MIN + 1
+    return view
+
+
 @app.get("/")
 def index():
     with _last_test_lock:
@@ -464,6 +618,9 @@ def index():
         idle_timeout=SESSION_IDLE_TIMEOUT,
         udp_listen_port=UDP_LISTEN_PORT,
         last_test=lt,
+        cooldown=UPSTREAM_PORT_COOLDOWN,
+        cooldown_max=PROPOSED_COOLDOWN_MAX,
+        observation=_observation_view(),
     )
 
 
@@ -478,7 +635,13 @@ def api_state():
         "sessions": state.snapshot_sessions(),
         "messages": [_format_message(m) for m in store.recent_messages(100)],
         "last_test": lt,
+        "observation": _observation_view(),
     })
+
+
+@app.get("/api/observation")
+def api_observation():
+    return jsonify(_observation_view())
 
 
 @app.post("/switch")
@@ -490,6 +653,46 @@ def switch():
         flash(f"已切换到接收器 {target}。新会话走 {target}，旧会话继续走原接收器直至过期。", "ok")
     except Exception as exc:
         flash(f"切换保存失败，保留原目标 {store.get_target()}。原因：{exc}", "error")
+    return redirect(url_for("index"))
+
+
+@app.post("/observe")
+def observe():
+    raw = request.form.get("cooldown", "").strip()
+    try:
+        proposed = float(raw)
+    except ValueError:
+        flash("拟定冷却秒数无效，未开始观察。", "error")
+        return redirect(url_for("index"))
+    if not math.isfinite(proposed):
+        flash("拟定冷却秒数无效，未开始观察。", "error")
+        return redirect(url_for("index"))
+    if proposed < UPSTREAM_PORT_COOLDOWN:
+        flash(f"拟定冷却 {proposed:g}s 不得短于现值 {UPSTREAM_PORT_COOLDOWN:g}s，未开始观察。",
+              "error")
+        return redirect(url_for("index"))
+    if proposed > PROPOSED_COOLDOWN_MAX:
+        flash(f"拟定冷却 {proposed:g}s 超过上限 {max(MAX_COOLDOWN, UPSTREAM_PORT_COOLDOWN):g}s，"
+              f"未开始观察。", "error")
+        return redirect(url_for("index"))
+
+    round_id = uuid.uuid4().hex
+    started = state.ports.begin_observation(
+        state.observation,
+        current_cooldown=UPSTREAM_PORT_COOLDOWN,
+        proposed_cooldown=proposed,
+        started_at=time.time(),
+        round_id=round_id,
+    )
+    if not started:
+        flash("已有一轮观察在进行，请等待其结束。", "error")
+    else:
+        state._persist_observation(state.observation.view())
+        store.log("event", note=f"开始端口池冷却试算观察：拟定冷却 {proposed:g}s，"
+                                f"窗口 {OBSERVE_WINDOW:g}s")
+        flash(f"已开始 {OBSERVE_WINDOW:g} 秒观察，拟定冷却 {proposed:g}s。"
+              f"期间可用原试传发出真实 UDP 报文；在线冷却仍为 {UPSTREAM_PORT_COOLDOWN:g}s。",
+              "ok")
     return redirect(url_for("index"))
 
 
