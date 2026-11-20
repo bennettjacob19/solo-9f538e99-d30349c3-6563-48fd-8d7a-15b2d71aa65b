@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -87,7 +88,7 @@ def start_receiver(name, port, logdir):
                             stdout=log, stderr=subprocess.STDOUT)
 
 
-def start_proxy(db_path, logdir, tag):
+def start_proxy(db_path, logdir, tag, extra_env=None):
     env = dict(
         os.environ,
         UDP_LISTEN_PORT=str(UDP_PORT), HTTP_PORT=str(HTTP_PORT),
@@ -95,9 +96,25 @@ def start_proxy(db_path, logdir, tag):
         RECEIVER_B_HOST="127.0.0.1", RECEIVER_B_PORT="19002",
         SESSION_IDLE_TIMEOUT="5", DB_PATH=db_path,
     )
+    if extra_env:
+        env.update(extra_env)
     log = open(os.path.join(logdir, f"proxy-{tag}.log"), "w")
     return subprocess.Popen([sys.executable, PROXY_PY], env=env,
                             stdout=log, stderr=subprocess.STDOUT)
+
+
+def wait_observation(status, timeout=45):
+    t0 = time.time()
+    last = None
+    while time.time() - t0 < timeout:
+        last = http_get("/api/observation")
+        rnd = last.get("round")
+        if rnd and rnd["status"] == status:
+            return rnd
+        if rnd and rnd["status"] in ("done", "invalid"):
+            return rnd
+        time.sleep(0.5)
+    return last.get("round") if last else None
 
 
 def main():
@@ -212,6 +229,139 @@ def main():
         except Exception:
             failed = True
         check("保存失败时切换报错且保留原目标", failed and s.get_target() == "B")
+
+        # 10. 冷却试算：参数校验
+        try:
+            http_post("/observation/start", {"cooldown_proposed": "1"})
+            bad = False
+        except urllib.error.HTTPError:
+            bad = True
+        # 小于现值时接口走 flash 重定向（200/302），检查没有产生 running 轮次
+        obs = http_get("/api/observation")
+        check("拟定冷却短于现值被拒绝",
+              not (obs["round"] and obs["round"]["status"] == "running"))
+        try:
+            http_post("/observation/start", {"cooldown_proposed": "121"})
+        except urllib.error.HTTPError:
+            pass
+        obs = http_get("/api/observation")
+        check("拟定冷却超过 120 秒被拒绝",
+              not (obs["round"] and obs["round"]["status"] == "running"))
+
+        # 11. 冷却试算：30 秒观察出结果，两档同记录、转发照常
+        http_post("/observation/start", {"cooldown_proposed": "60"})
+        running = http_get("/api/observation")["round"]
+        check("观察开始状态为 running", running and running["status"] == "running",
+              str(running))
+        c_obs = udp_client()
+        check("观察期间转发照常", send_recv(c_obs, b"obs-traffic", timeout=5) == b"obs-traffic")
+        done = wait_observation("done", timeout=40)
+        check("观察正常结束并给出结果", done and done["status"] == "done", str(done))
+        if done and done["status"] == "done":
+            res = done["result"]
+            check("现用与拟定档都给了最少端口数",
+                  res["ports_now"] >= 1 and res["ports_proposed"] >= 1, str(res))
+            check("拟定冷却(60s)所需端口不少于现用(30s)",
+                  res["ports_proposed"] >= res["ports_now"], str(res))
+            check("给出了两档首次峰值时刻",
+                  "peak_wall_now" in res and "peak_wall_proposed" in res, str(res))
+            check("在线冷却配置未被试算改动",
+                  http_get("/api/observation")["cooldown_now"] == 30)
+
+        # 12. 冷却试算：代理途中重启 → 本轮作废且只显示原因
+        http_post("/observation/start", {"cooldown_proposed": "45"})
+        time.sleep(1)
+        proxy.terminate()
+        proxy.wait(timeout=10)
+        proxy = start_proxy(db_path, tmp, "run3")
+        procs.append(proxy)
+        check("代理重启后恢复", wait_http_up())
+        obs = http_get("/api/observation")
+        rnd = obs["round"]
+        check("途中重启后本轮标记作废", rnd and rnd["status"] == "invalid", str(rnd))
+        check("作废轮次只显示原因、无试算数字",
+              rnd and rnd.get("result") is None and "重启" in rnd.get("reason", ""), str(rnd))
+
+        # 13. 冷却试算：短冷却制造端口复用，验证“旧冷却另算一个端口”
+        #     池子要够大：拟定 120 秒档下窗口内用过的端口都不回收，不能耗尽
+        proxy.terminate()
+        proxy.wait(timeout=10)
+        db2 = os.path.join(tmp, "proxy2.db")
+        proxy = start_proxy(db2, tmp, "run4", extra_env={
+            "UPSTREAM_PORT_MIN": "21000", "UPSTREAM_PORT_MAX": "21029",
+            "UPSTREAM_PORT_COOLDOWN": "1",
+        })
+        procs.append(proxy)
+        check("短冷却代理启动", wait_http_up())
+        http_post("/observation/start", {"cooldown_proposed": "120"})
+        time.sleep(0.5)
+        # 每 0.7 秒换一个新客户端：会话 5 秒空闲过期 → 关端口；
+        # 冷却仅 1 秒，端口很快被复用，而拟定 120 秒档下旧冷却远未结束
+        t_end = time.time() + 12
+        i = 0
+        while time.time() < t_end:
+            s = udp_client()
+            s.settimeout(3)
+            s.send(f"reuse-{i}".encode())
+            try:
+                s.recv(65535)
+            except socket.timeout:
+                pass
+            s.close()
+            i += 1
+            time.sleep(0.7)
+        done = wait_observation("done", timeout=40)
+        check("复用场景观察正常结束", done and done["status"] == "done", str(done))
+        if done and done["status"] == "done":
+            res = done["result"]
+            check("拟定 120 秒档所需端口严格大于现用 1 秒档（旧冷却另算）",
+                  res["ports_proposed"] > res["ports_now"], str(res))
+
+        # 14. 试算算法单元验证：开场记录 + 复用 + 绑定失败归还 + 开口区间
+        sys.path.insert(0, os.path.join(ROOT, "proxy"))
+        import app as proxy_app
+        opening = {"in_use": {100: 90.0}, "cooling": {101: 95.0}}
+        events = [
+            (102, "reserve", 102.0),
+            (102, "release", 103.0),
+            (103, "reserve", 104.0),
+            (103, "release", 105.0),
+            (104, "reserve", 106.0),
+            (104, "return_failed", 106.5),
+            (105, "reserve", 108.0),
+            (105, "release", 109.0),
+            (102, "reserve", 110.0),
+        ]
+        t0 = 100.0
+        p_now, off_now = proxy_app.compute_port_peak(opening, events, t0, 1.0)
+        p_prop, off_prop = proxy_app.compute_port_peak(opening, events, t0, 30.0)
+        # 现用档（C=1）：开场 in_use=100 给基线 1、101 冷却到 96 已过期；
+        # t=102 预留 102 → 峰值 2（offset 2000ms），随后各占用在 1 秒冷却下快速回收。
+        check("算法-现用档峰值与首次峰值时刻", (p_now, off_now) == (2, 2000),
+              f"got {(p_now, off_now)}")
+        # 拟定档（C=30）：所有关闭端口的冷却都延伸到窗口之后；t=110 复用 102 时
+        # 其旧冷却（到 133）未结束，与新预留并列另算一个 → 峰值 6（offset 10000ms）。
+        check("算法-拟定档旧冷却另算一个端口", (p_prop, off_prop) == (6, 10000),
+              f"got {(p_prop, off_prop)}")
+        check("算法-拟定档端口数不少于现用档", p_prop >= p_now)
+
+        # 边界：开场冷却按各档重算；开场在使用端口的复用分段计数
+        op_cool = {"in_use": {}, "cooling": {200: 95.0}}
+        check("算法-开场冷却现用档已过期不计",
+              proxy_app.compute_port_peak(op_cool, [], t0, 1.0) == (0, 0))
+        check("算法-开场冷却拟定档未过期计入",
+              proxy_app.compute_port_peak(op_cool, [], t0, 10.0) == (1, 0))
+        op_use = {"in_use": {300: 99.0}, "cooling": {}}
+        check("算法-开场在使用无事件为开口区间",
+              proxy_app.compute_port_peak(op_use, [], t0, 2.0) == (1, 0))
+        # 预留[100,105) + 冷却[105,107) + 复用后新预留[106,∞)：
+        # 106 起该端口旧冷却段与新预留段两个占用并列 → 峰值 2（offset 6000ms）
+        check("算法-同端口复用旧冷却独立计数",
+              proxy_app.compute_port_peak(
+                  op_use, [(300, "release", 105.0), (300, "reserve", 106.0)], t0, 2.0
+              ) == (2, 6000))
+        check("算法-空记录峰值为 0",
+              proxy_app.compute_port_peak({"in_use": {}, "cooling": {}}, [], t0, 2.0) == (0, 0))
 
     finally:
         for p in procs:

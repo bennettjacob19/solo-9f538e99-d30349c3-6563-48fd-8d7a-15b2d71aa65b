@@ -58,6 +58,26 @@
 </section>
 
 <section>
+  <h2>冷却期端口池试算 <span class="hint">（{{ observation.duration }} 秒观察，不改在线配置）</span></h2>
+  <form method="post" action="{{ url_for('observation_start') }}">
+    <div class="row">
+      <label>拟定冷却(秒)
+        <input name="cooldown_proposed" type="number" min="{{ observation.cooldown_now }}"
+               max="{{ observation.cooldown_max }}" step="1" required style="width:90px"
+               value="{{ observation.cooldown_now }}">
+      </label>
+      <button type="submit">开始 {{ observation.duration }} 秒观察</button>
+      <span class="hint">不短于现值 {{ observation.cooldown_now }} 秒、最多 {{ observation.cooldown_max }} 秒</span>
+    </div>
+    <p class="hint">开始后用下方“发送试传报文”或外部终端照常发真实 UDP。页面基于<b>同一段实际端口占用记录</b>，
+      分别给出现用冷却（{{ observation.cooldown_now }} 秒）和拟定冷却下所需的<b>最少端口数</b>及<b>首次达到峰值的时刻</b>。
+      端口从预留起占用，绑定失败归还即结束，正常关闭还要算上冷却；拟定冷却下旧冷却未结束时，即使端口已复用也另算一个端口。
+      缺少开场记录、单轮变更超过 4096 次、有会话建连失败或代理途中重启时，本轮只显示作废原因。</p>
+  </form>
+  <div id="observation" style="margin-top:10px"></div>
+</section>
+
+<section>
   <h2>发送试传报文</h2>
   <form method="post" action="{{ url_for('test') }}">
     <div class="row">
@@ -119,6 +139,62 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 2000);
+
+function fmtWall(sec) {
+  const d = new Date(sec * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}` +
+         `.${String(d.getMilliseconds()).padStart(3, '0')}`;
+}
+function fmtOffset(ms) {
+  if (ms < 1000) return `开始后 ${ms} ms`;
+  return `开始后 ${(ms / 1000).toFixed(3)} s`;
+}
+async function refreshObservation() {
+  const el = document.getElementById('observation');
+  let o;
+  try { o = await (await fetch('/api/observation')).json(); }
+  catch (e) { return; }
+  const r = o.round;
+  if (!r) { el.innerHTML = '<p class="hint">（暂无观察轮次）</p>'; return; }
+
+  if (r.status === 'running') {
+    el.innerHTML =
+      `<div class="flash ok">观察进行中：已记录 <b>${r.change_count}</b> 次占用变更，` +
+      `${r.duration} 秒后自动出结果。期间可继续发试传报文，转发不受影响。</div>`;
+    return;
+  }
+  if (r.status === 'invalid') {
+    el.innerHTML =
+      `<div class="flash error">本轮试算作废：${esc(r.reason)}</div>` +
+      `<p class="hint">在线配置未改动，转发照常；可重新开始一轮观察。</p>`;
+    return;
+  }
+  const res = r.result;
+  if (!res) {
+    el.innerHTML = `<div class="flash error">本轮结果缺失（状态 ${esc(r.status)}），请重新开始一轮观察。</div>`;
+    return;
+  }
+  const bigger = res.ports_proposed > res.ports_now;
+  el.innerHTML =
+    `<div class="card">
+      <div class="label">观察结果（开始于 ${fmtWall(r.started_wall)}，共 ${r.duration} 秒，${res.change_count} 次占用变更）</div>
+      <table style="margin-top:6px">
+        <thead><tr><th>冷却档位</th><th>冷却(秒)</th><th>所需最少端口数</th><th>首次达到峰值时刻</th></tr></thead>
+        <tbody>
+          <tr><td>现用</td><td>${r.cooldown_now}</td><td><b>${res.ports_now}</b></td>
+            <td>${fmtWall(res.peak_wall_now)}（${fmtOffset(res.peak_offset_now_ms)}）</td></tr>
+          <tr><td>拟定</td><td>${r.cooldown_proposed}</td>
+            <td><b>${res.ports_proposed}</b>${bigger ? ' <span class="result-err">↑</span>' : ''}</td>
+            <td>${fmtWall(res.peak_wall_proposed)}（${fmtOffset(res.peak_offset_proposed_ms)}）</td></tr>
+        </tbody>
+      </table>
+      <p class="hint">两档数字来自同一段实际占用记录；拟定档把每次正常关闭后的冷却按 ${r.cooldown_proposed} 秒重算。
+        试算未改动在线配置，当前冷却仍为 ${r.cooldown_now} 秒。</p>
+    </div>`;
+}
+refreshObservation();
+setInterval(refreshObservation, 1000);
 </script>
 </body>
 </html>
